@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>New SKU Request — Control Room</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@600;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: #0c0e12; }
+  .wrap { font-family: 'IBM Plex Sans', sans-serif; background: #0c0e12; color: #e7ebf0; min-height: 100vh; padding: 24px; }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  .display { font-family: 'Archivo', sans-serif; letter-spacing: -0.02em; }
+  .panel { background: #14171d; border: 1px solid #232833; border-radius: 14px; }
+  .pill { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; letter-spacing: .04em; }
+  .tab { padding: 8px 14px; border-radius: 9px; font-size: 13px; font-weight: 500; cursor: pointer; border: 1px solid transparent; background: transparent; color: #97a1b0; transition: .15s; }
+  .tab:hover { color: #e7ebf0; background: #1b1f27; }
+  .tab.on { background: #1f2530; color: #fff; border-color: #2d3543; }
+  .kpi { font-family: 'Archivo'; font-weight: 800; font-size: 30px; line-height: 1; }
+  .bar { height: 5px; border-radius: 4px; background: #232833; overflow: hidden; }
+  .barfill { height: 100%; transition: width .4s; }
+  .card { transition: .15s; cursor: pointer; }
+  .card:hover { border-color: #38465c; transform: translateY(-1px); }
+  .lane { border-left: 2px solid #232833; padding-left: 12px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .field { font-size: 12px; padding: 5px 8px; border-radius: 6px; background: #1b1f27; border: 1px solid #232833; }
+  .btn { font-family:'IBM Plex Sans'; font-size:12px; font-weight:600; color:#cdd4dd; background:#1b1f27; border:1px solid #2d3543; border-radius:8px; padding:7px 12px; cursor:pointer; }
+  .btn:hover { background:#222836; color:#fff; }
+  .btn.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  .btn.primary:hover { background:#2f7ffb; }
+  a { color:#6ea8fe; }
+</style>
+</head>
+<body>
+<div class="wrap" id="root">Loading…</div>
+
+<!-- MSAL (Microsoft sign-in) -->
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.10.0/lib/msal-browser.min.js"></script>
+<script>
+/* =========================================================================
+   NEW SKU REQUEST — CONTROL ROOM  (live via Microsoft Graph + MSAL)
+   - Signs the viewer in with their Microsoft (Ahram Security Group) account.
+   - Reads the "SKU Requests" list LIVE through Microsoft Graph.
+   - Same dark control-room design; no per-second clock (manual Refresh).
+   - Falls back to bundled demo data only if Graph can't be reached, with a banner.
+
+   >>> ONE THING TO FILL IN AFTER THE APP REGISTRATION IS CREATED:
+       set CLIENT_ID below to the Application (client) ID from Azure / Entra.
+   ========================================================================= */
+
+/* ---------- CONFIG ---------- */
+var CLIENT_ID = "PASTE_CLIENT_ID_HERE";                         // <-- from the app registration
+var TENANT_ID = "c43e2562-796a-4a48-9c5b-6623223007e9";          // Ahram Security Group tenant
+var GRAPH_SITE_ID = "ahramsecurityg-my.sharepoint.com,fabde13d-e468-4d11-a9dc-920f79dda819,cf6eb9cc-a9c9-4293-8ba5-cee5a98f642f";
+var GRAPH_LIST_ID = "f9ea28f9-af46-4a24-801a-90f178e01dea";
+var GRAPH_SCOPES  = ["Sites.Read.All"];                          // delegated; reads SharePoint/OneDrive lists the user can see
+/* ---------------------------- */
+
+var HOUR = 3600 * 1000, DAY = 24 * HOUR;
+
+/* Per-stage SLA + owning department (mirrors Flow 2 config map) */
+var STAGE_META = {
+  "Intake / Specification":   { dept: "Sales",       sla: 2 },
+  "Product Review & Spec":    { dept: "Product",     sla: 3 },
+  "Sourcing":                 { dept: "Procurement", sla: 7 },
+  "Sample Procurement":       { dept: "Procurement", sla: 8 },
+  "Sample Payment":           { dept: "Finance",     sla: 3 },
+  "Sample Inbound":           { dept: "Logistics",   sla: 4 },
+  "Sample Quality":           { dept: "Quality",     sla: 3 },
+  "Final Price Quote":        { dept: "Procurement", sla: 5 },
+  "Landed Cost":              { dept: "Logistics",   sla: 3 },
+  "Engineering":              { dept: "Engineering", sla: 5 },
+  "Engineering: Desc / Routing": { dept: "Engineering", sla: 5 },
+  "Final Quality Check":      { dept: "Quality",     sla: 2 },
+  "Product Sets Price":       { dept: "Product",     sla: 2 },
+  "Finance Final Approval":   { dept: "Finance",     sla: 2 },
+  "SKU Active":               { dept: "System",      sla: 0 },
+  "SKU Active on Oracle":     { dept: "System",      sla: 0 }
+};
+var DEPTS = ["Sales","Product","Procurement","Logistics","Quality","Engineering","Finance"];
+var DEPT_COLORS = { Sales:"#6ea8fe", Product:"#9d8df1", Procurement:"#3ddc97", Logistics:"#f5a623", Quality:"#ff7eb6", Engineering:"#54d2ff", Finance:"#ffd166", System:"#8b95a5" };
+
+/* ---- demo fallback (used only when live data is unreachable) ---- */
+function demoData(){
+  var now = Date.now(), ago = function(h){ return new Date(now - h*HOUR).toISOString(); };
+  return [
+    { id:"SKU-1045", product:"Wireless Doorbell V2",  category:"Electronics", stage:"Product Review & Spec", dept:"Product",     assigned:"product.team@ahramsg.com",     stageEntered:ago(14),  status:"Active" },
+    { id:"SKU-1042", product:"Stainless Bottle 750ml", category:"Kitchenware", stage:"Sample Quality",        dept:"Quality",     assigned:"procurement.team@ahramsg.com", stageEntered:ago(80),  status:"Active" },
+    { id:"SKU-1043", product:"USB-C Hub 7-in-1",       category:"Electronics", stage:"Sourcing",              dept:"Procurement", assigned:"procurement.team@ahramsg.com", stageEntered:ago(150), status:"Active" },
+    { id:"SKU-1044", product:"Bamboo Board Set",       category:"Kitchenware", stage:"Landed Cost",           dept:"Logistics",   assigned:"logistics.team@ahramsg.com",   stageEntered:ago(40),  status:"Active" },
+    { id:"SKU-1041", product:"LED Desk Lamp",          category:"Electronics", stage:"Finance Final Approval",dept:"Finance",     assigned:"finance.team@ahramsg.com",     stageEntered:ago(10),  status:"Active" }
+  ];
+}
+
+/* ---- MSAL auth ---- */
+var msalApp = null, account = null;
+function msalReady(){
+  if(CLIENT_ID === "PASTE_CLIENT_ID_HERE") return Promise.reject(new Error("CLIENT_ID not set"));
+  if(msalApp) return Promise.resolve(msalApp);
+  msalApp = new msal.PublicClientApplication({
+    auth: { clientId: CLIENT_ID, authority: "https://login.microsoftonline.com/" + TENANT_ID, redirectUri: window.location.origin + window.location.pathname },
+    cache: { cacheLocation: "sessionStorage" }
+  });
+  return msalApp.initialize().then(function(){
+    return msalApp.handleRedirectPromise();
+  }).then(function(resp){
+    if(resp && resp.account) account = resp.account;
+    if(!account){ var a = msalApp.getAllAccounts(); if(a.length) account = a[0]; }
+    return msalApp;
+  });
+}
+function signIn(){ msalReady().then(function(app){ app.loginRedirect({ scopes: GRAPH_SCOPES }); }).catch(function(e){ STATE.error=e.message; render(); }); }
+function signOut(){ if(msalApp){ msalApp.logoutRedirect({ account: account }); } }
+function getToken(){
+  return msalReady().then(function(app){
+    if(!account) throw new Error("not-signed-in");
+    return app.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: account })
+      .catch(function(){ return app.acquireTokenRedirect({ scopes: GRAPH_SCOPES }); });
+  }).then(function(r){ return r && r.accessToken; });
+}
+
+/* ---- live pull from Microsoft Graph ---- */
+function fetchLive(){
+  return getToken().then(function(token){
+    var url = "https://graph.microsoft.com/v1.0/sites/" + GRAPH_SITE_ID + "/lists/" + GRAPH_LIST_ID +
+              "/items?expand=fields(select=Title,field_1,field_2,field_3,field_4,field_5,field_6,field_8,field_9,StageEntered,field_22,SLAStatus)&$top=200";
+    return fetch(url, { headers: { Authorization: "Bearer " + token } })
+      .then(function(r){ if(!r.ok) return r.text().then(function(t){ throw new Error("Graph "+r.status+": "+t.slice(0,140)); }); return r.json(); })
+      .then(function(j){
+        return (j.value||[]).map(function(it){
+          var f = it.fields || {};
+          return {
+            id: f.Title || ("ID-"+it.id), product: f.field_1 || "(unnamed)", category: f.field_2 || "",
+            makeBuy: f.field_3 || "", stage: f.field_4 || "", dept: f.field_5 || "",
+            assigned: f.field_6 || "", sla: f.field_8, status: f.field_9 || "",
+            stageEntered: f.StageEntered, escalation: f.field_22 || "", slaStatus: f.SLAStatus || ""
+          };
+        });
+      });
+  });
+}
+
+/* ---- helpers ---- */
+function fmtClock(ms){ if(ms<0)ms=0; var d=Math.floor(ms/DAY),h=Math.floor((ms%DAY)/HOUR),m=Math.floor((ms%HOUR)/60000); var p=function(n){return String(n).padStart(2,"0")}; return d+"d "+p(h)+":"+p(m); }
+function slaState(elapsed, slaDays){
+  var sla=slaDays*DAY, pct = sla>0 ? elapsed/sla : 0;
+  if(slaDays>0 && pct>=1) return {level:"breach", label:"OVERDUE",  notify:"Manager notified", color:"#ff5c5c", pct:Math.min(100,pct*100)};
+  if(slaDays>0 && pct>=0.8) return {level:"warn",  label:"AT RISK",  notify:"Owner notified",   color:"#f5a623", pct:Math.min(100,pct*100)};
+  return {level:"ok", label:"ON TRACK", notify:"", color:"#3ddc97", pct:Math.min(100,pct*100)};
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); }
+
+/* ---- state + render ---- */
+var STATE = { rows:[], dept:"ALL", live:false, asOf:null, openId:null, error:null, signedIn:false, who:null, needsConfig:(CLIENT_ID==="PASTE_CLIENT_ID_HERE") };
+
+function deriveActive(rows){
+  var now=Date.now(), out=[];
+  rows.forEach(function(r){
+    if(r.status && String(r.status).toLowerCase()!=="active") return;
+    var meta = STAGE_META[r.stage] || { dept:(r.dept||"System"), sla:(r.sla||0) };
+    var dept = r.dept || meta.dept;
+    var sla  = (r.sla!=null ? Number(r.sla) : meta.sla);
+    var started = r.stageEntered ? new Date(r.stageEntered).getTime() : now;
+    var elapsed = now - started;
+    out.push({ r:r, dept:dept, sla:sla, elapsed:elapsed, slaObj:slaState(elapsed, sla) });
+  });
+  return out;
+}
+
+function render(){
+  var root=document.getElementById("root");
+  var active = deriveActive(STATE.rows);
+  var overdue = active.filter(function(a){return a.slaObj.level==="breach";});
+  var atRisk  = active.filter(function(a){return a.slaObj.level==="warn";});
+  var dept = STATE.dept;
+  var visIds = {}; active.forEach(function(a){ if(dept==="ALL"||a.dept===dept) visIds[a.r.id]=true; });
+  var visRows = STATE.rows.filter(function(r){ return dept==="ALL" ? true : visIds[r.id]; })
+                          .filter(function(r){ return !r.status || String(r.status).toLowerCase()==="active"; });
+
+  var html = "";
+  /* header */
+  html += '<div style="display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:16px;margin-bottom:18px">';
+  html +=   '<div><div class="display" style="font-size:26px;font-weight:800">New SKU Request — Control Room</div>';
+  html +=   '<div style="color:#97a1b0;font-size:13px;margin-top:4px">Buy path · live SLA tracking · '+active.length+' active stage'+(active.length===1?"":"s")+'</div></div>';
+  html +=   '<div style="text-align:right;display:flex;gap:8px;align-items:center">';
+  if(STATE.signedIn){ html += '<span class="mono" style="color:#6b7484;font-size:11px">'+esc(STATE.who||"")+'</span><button class="btn" onclick="reload()">↻ Refresh</button><button class="btn" onclick="signOut()">Sign out</button>'; }
+  else if(!STATE.needsConfig){ html += '<button class="btn primary" onclick="signIn()">Sign in with Microsoft</button>'; }
+  html +=   '</div>';
+  html += '</div>';
+  if(STATE.asOf){ html += '<div class="mono" style="color:#6b7484;font-size:11px;margin:-8px 0 12px">as of '+esc(STATE.asOf)+'</div>'; }
+
+  /* config-needed banner */
+  if(STATE.needsConfig){
+    html += '<div class="panel" style="padding:14px 16px;margin-bottom:14px;border-color:#3a3320;background:#1a160d;font-size:13px;color:#ffd166">⚙ Setup needed — paste the app registration\'s <b>Application (client) ID</b> into <span class="mono">CLIENT_ID</span> at the top of this file, then redeploy. Until then the dashboard shows demo data below.</div>';
+  } else if(STATE.live){
+    html += '<div class="panel" style="padding:8px 14px;margin-bottom:14px;border-color:#1f3a2b;background:#101a14;font-size:12px;color:#7ee0a8">● LIVE — connected to the SKU Requests list via Microsoft Graph ('+STATE.rows.length+' records).</div>';
+  } else if(STATE.signedIn){
+    html += '<div class="panel" style="padding:8px 14px;margin-bottom:14px;border-color:#5a2630;background:#1d1417;font-size:12px;color:#ff8f8f">● Signed in, but the list could not be read'+(STATE.error?(' — '+esc(STATE.error)):'')+'. You may not have access to the list, or admin consent for Sites.Read.All is still pending.</div>';
+  } else {
+    html += '<div class="panel" style="padding:8px 14px;margin-bottom:14px;border-color:#3a3320;background:#1a160d;font-size:12px;color:#ffd166">● DEMO DATA — sign in with your Microsoft account (button top-right) to load the live list.</div>';
+  }
+
+  /* KPIs */
+  var kpis=[ {k:visRows.length,l:"Open requests",c:"#e7ebf0"}, {k:active.length,l:"Active stages now",c:"#6ea8fe"}, {k:atRisk.length,l:"At risk (≥80% SLA)",c:"#f5a623"}, {k:overdue.length,l:"Overdue → manager",c:"#ff5c5c"} ];
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:18px">';
+  kpis.forEach(function(x){ html += '<div class="panel" style="padding:16px 18px"><div class="kpi" style="color:'+x.c+'">'+x.k+'</div><div style="color:#97a1b0;font-size:12px;margin-top:6px">'+x.l+'</div></div>'; });
+  html += '</div>';
+
+  /* escalation banner */
+  if(overdue.length){
+    html += '<div class="panel" style="padding:12px 16px;margin-bottom:16px;border-color:#5a2630;background:#1d1417">';
+    html +=   '<span class="pill" style="background:#ff5c5c;color:#1a0d0f">ESCALATION</span>';
+    html +=   '<span style="margin-left:12px;font-size:13px">'+ overdue.map(function(o){return esc(o.r.id)+' stuck at "'+esc(o.r.stage)+'" ('+esc(o.dept)+')';}).join("  ·  ") +'</span>';
+    html += '</div>';
+  }
+
+  /* dept tabs */
+  html += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px">';
+  html +=   '<button class="tab '+(dept==="ALL"?"on":"")+'" onclick="setDept(\'ALL\')">All Requests</button>';
+  DEPTS.forEach(function(d){ var cnt=active.filter(function(a){return a.dept===d;}).length;
+    html += '<button class="tab '+(dept===d?"on":"")+'" onclick="setDept(\''+d+'\')"><span class="dot" style="background:'+(DEPT_COLORS[d]||"#8b95a5")+';margin-right:7px"></span>'+d+(cnt?(' <span class="mono" style="margin-left:7px;color:#97a1b0">'+cnt+'</span>'):"")+'</button>';
+  });
+  html += '</div>';
+
+  /* cards */
+  html += '<div style="display:flex;flex-direction:column;gap:12px">';
+  if(!visRows.length){ html += '<div class="panel" style="padding:20px;color:#97a1b0">No active requests'+(dept==="ALL"?"":' sitting with '+dept)+'.</div>'; }
+  visRows.forEach(function(r){
+    var acts = active.filter(function(a){return a.r.id===r.id;});
+    var open = STATE.openId===r.id;
+    html += '<div class="panel card" onclick="toggle(\''+esc(r.id)+'\')" style="padding:16px">';
+    html +=   '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+    html +=     '<div><span class="mono" style="color:#6ea8fe;font-size:12px">'+esc(r.id)+'</span>';
+    html +=       '<span class="display" style="font-weight:600;font-size:17px;margin-left:10px">'+esc(r.product)+'</span>';
+    html +=       '<div style="color:#97a1b0;font-size:12px;margin-top:3px">'+esc(r.category||"")+(r.assigned?(' · '+esc(r.assigned)):"")+'</div></div>';
+    html +=     '<div style="display:flex;gap:10px;flex-wrap:wrap">';
+    acts.forEach(function(a){
+      html += '<div style="text-align:right">';
+      html +=   '<div style="font-size:12px;color:#cdd4dd"><span class="dot" style="background:'+(DEPT_COLORS[a.dept]||"#8b95a5")+';margin-right:6px"></span>'+esc(a.r.stage)+'</div>';
+      html +=   '<div class="mono" style="font-size:18px;font-weight:600;color:'+a.slaObj.color+'">'+fmtClock(a.elapsed)+'</div>';
+      html +=   '<span class="pill" style="background:'+a.slaObj.color+';color:#0c0e12">'+a.slaObj.label+' · SLA '+a.sla+'d'+(a.slaObj.notify?(' · '+a.slaObj.notify):"")+'</span>';
+      html += '</div>';
+    });
+    html +=     '</div></div>';
+    html += '<div style="margin-top:12px;display:flex;flex-direction:column;gap:6px">';
+    acts.forEach(function(a){ html += '<div class="bar"><div class="barfill" style="width:'+a.slaObj.pct+'%;background:'+a.slaObj.color+'"></div></div>'; });
+    html += '</div>';
+    if(open){
+      html += '<div style="margin-top:14px;color:#97a1b0;font-size:12px;line-height:1.7">';
+      html +=   'Category: '+esc(r.category||"—")+' &nbsp;·&nbsp; Make/Buy: '+esc(r.makeBuy||"—")+'<br>';
+      html +=   'Owner dept: '+esc(r.dept||"—")+' &nbsp;·&nbsp; Assigned: '+esc(r.assigned||"—")+'<br>';
+      html +=   'Escalation manager: '+esc(r.escalation||"—")+' &nbsp;·&nbsp; Stage entered: '+esc(r.stageEntered?new Date(r.stageEntered).toLocaleString():"—")+'<br>';
+      html +=   'SLA status (server): '+esc(r.slaStatus||"—");
+      html += '</div>';
+    }
+    html += '</div>';
+  });
+  html += '</div>';
+
+  html += '<div style="color:#5a6373;font-size:11px;margin-top:20px">Live SLA control board for the New SKU (Buy) workflow · click a request to expand details · Refresh re-pulls the list via Microsoft Graph.</div>';
+
+  root.innerHTML = html;
+}
+
+/* ---- actions ---- */
+window.setDept = function(d){ STATE.dept=d; render(); };
+window.toggle  = function(id){ STATE.openId = STATE.openId===id?null:id; render(); };
+window.reload  = function(){ load(); };
+window.signIn  = signIn;
+window.signOut = signOut;
+
+function load(){
+  if(STATE.needsConfig){ STATE.rows=demoData(); STATE.asOf=new Date().toLocaleString(); render(); return; }
+  msalReady().then(function(){
+    STATE.signedIn = !!account; STATE.who = account ? (account.username||account.name) : null;
+    if(!account){ STATE.rows=demoData(); STATE.live=false; STATE.asOf=new Date().toLocaleString(); render(); return; }
+    fetchLive().then(function(rows){
+      STATE.rows=rows; STATE.live=true; STATE.error=null; STATE.asOf=new Date().toLocaleString(); render();
+    }).catch(function(e){
+      STATE.rows=demoData(); STATE.live=false; STATE.error=(e&&e.message)||"unreachable"; STATE.asOf=new Date().toLocaleString(); render();
+    });
+  }).catch(function(e){
+    STATE.rows=demoData(); STATE.error=(e&&e.message)||""; STATE.asOf=new Date().toLocaleString(); render();
+  });
+}
+load();
+</script>
+</body>
+</html>
